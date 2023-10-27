@@ -329,6 +329,7 @@ void resize_viewport(ctx_t * ctx) {
     }
 
     // updating GL viewport
+    log_debug(ctx, "egl::resize_viewport(): win = %dx%d, view = %dx%d, tex = %dx%d\n", win_width, win_height, view_width, view_height, tex_width, tex_height);
     glViewport((win_width - view_width) / 2, (win_height - view_height) / 2, view_width, view_height);
 
     // recalculate texture transform
