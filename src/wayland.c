@@ -500,15 +500,112 @@ static const struct wl_surface_listener surface_listener = {
 static void on_surface_configure_finished(ctx_t * ctx) {
     // acknowledge configure and commit surface to finish configure sequence
     log_debug(ctx, "wayland::on_surface_configure_finished(): window configured\n");
+#ifdef WITH_LIBDECOR
+
+#else
     xdg_surface_ack_configure(ctx->wl.xdg_surface, ctx->wl.last_surface_serial);
+#endif
     wl_surface_commit(ctx->wl.surface);
 
     // reset configure sequence state machine
+#ifndef WITH_LIBDECOR
     ctx->wl.xdg_surface_configured = false;
     ctx->wl.xdg_toplevel_configured = false;
+#endif
     ctx->wl.configured = true;
 }
 
+#ifdef WITH_LIBDECOR
+// --- libdecor event handlers ---
+
+// HACK: needed because on_libdecor_error does not have a userdata parameter
+static ctx_t * libdecor_error_context = NULL;
+
+static void on_libdecor_error(
+    struct libdecor * libdecor_context,
+    enum libdecor_error error, const char * message
+) {
+    ctx_t * ctx = libdecor_error_context;
+
+    log_error("wayland::on_libdecor_error(): error %d, %s\n", error, message);
+    exit_fail(ctx);
+
+    (void)libdecor_context;
+}
+
+static struct libdecor_interface libdecor_listener = {
+    .error = on_libdecor_error,
+};
+
+// --- libdecor_frame event handlers ---
+
+static void on_libdecor_frame_configure(
+    struct libdecor_frame * frame,
+    struct libdecor_configuration * configuration, void * data
+) {
+    ctx_t * ctx = (ctx_t *)data;
+
+    int width = 0;
+    int height = 0;
+    if (!libdecor_configuration_get_content_size(configuration, frame, &width, &height)) {
+        if (ctx->wl.width == 0 || ctx->wl.height == 0) {
+            log_debug(ctx, "wayland::on_libdecor_frame_configure(): falling back to default width\n");
+            width = 100;
+            height = 100;
+        } else {
+            log_debug(ctx, "wayland::on_libdecor_frame_configure(): falling back to previous width\n");
+            width = ctx->wl.width;
+            height = ctx->wl.height;
+        }
+    }
+
+    struct libdecor_state * state = libdecor_state_new(width, height);
+    libdecor_frame_commit(frame, state, configuration);
+    libdecor_state_free(state);
+
+    // update size only if changed
+    if (ctx->wl.width != (uint32_t)width || ctx->wl.height != (uint32_t)height) {
+        log_debug(ctx, "wayland::on_libdecor_frame_configure(): window resized to %dx%d\n", width, height);
+        ctx->wl.width = width;
+        ctx->wl.height = height;
+
+        // resize window to reflect new surface size
+        if (ctx->egl.initialized) {
+            resize_window(ctx);
+        }
+    }
+
+    // update configure sequence state machine
+    on_surface_configure_finished(ctx);
+}
+
+static void on_libdecor_frame_commit(
+    struct libdecor_frame * frame, void * data
+) {
+    ctx_t * ctx = (ctx_t *)data;
+
+    (void)frame;
+    (void)ctx;
+}
+
+static void on_libdecor_frame_close(
+    struct libdecor_frame * frame, void * data
+) {
+    ctx_t * ctx = (ctx_t *)data;
+
+    log_debug(ctx, "wayland::on_libdecor_frame_close(): close request received\n");
+    ctx->wl.closing = true;
+
+    (void)frame;
+}
+
+static struct libdecor_frame_interface libdecor_frame_listener = {
+    .configure = on_libdecor_frame_configure,
+    .commit = on_libdecor_frame_commit,
+    .close = on_libdecor_frame_close,
+};
+
+#else
 // --- xdg_surface event handlers ---
 
 static void on_xdg_surface_configure(
@@ -581,14 +678,23 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener = {
     .configure = on_xdg_toplevel_configure,
     .close = on_xdg_toplevel_close
 };
+#endif
 
-static void on_loop_event(ctx_t * ctx) {
+// --- wayland event loop handlers ---
+
+static void on_wayland_event(ctx_t * ctx) {
     if (wl_display_dispatch(ctx->wl.display) == -1) {
         ctx->wl.closing = true;
     }
+
+#ifdef WITH_LIBDECOR
+    if (libdecor_dispatch(ctx->wl.libdecor_context, 0) < 0) {
+        ctx->wl.closing = true;
+    }
+#endif
 }
 
-static void on_loop_each(ctx_t * ctx) {
+static void on_wayland_each(ctx_t * ctx) {
     wl_display_flush(ctx->wl.display);
 }
 
@@ -618,8 +724,13 @@ void init_wl(ctx_t * ctx) {
     ctx->wl.outputs = NULL;
 
     ctx->wl.surface = NULL;
+#ifdef WITH_LIBDECOR
+    ctx->wl.libdecor_context = NULL;
+    ctx->wl.libdecor_frame = NULL;
+#else
     ctx->wl.xdg_surface = NULL;
     ctx->wl.xdg_toplevel = NULL;
+#endif
 
     ctx->wl.current_output = NULL;
     ctx->wl.width = 0;
@@ -628,12 +739,14 @@ void init_wl(ctx_t * ctx) {
 
     ctx->wl.event_handler.fd = -1;
     ctx->wl.event_handler.events = EPOLLIN;
-    ctx->wl.event_handler.on_event = on_loop_event;
-    ctx->wl.event_handler.on_each = on_loop_each;
+    ctx->wl.event_handler.on_event = on_wayland_event;
+    ctx->wl.event_handler.on_each = on_wayland_each;
 
     ctx->wl.last_surface_serial = 0;
+#ifndef WITH_LIBDECOR
     ctx->wl.xdg_surface_configured = false;
     ctx->wl.xdg_toplevel_configured = false;
+#endif
     ctx->wl.configured = false;
     ctx->wl.closing = false;
     ctx->wl.initialized = true;
@@ -694,6 +807,32 @@ void init_wl(ctx_t * ctx) {
     // - for leave event
     wl_surface_add_listener(ctx->wl.surface, &surface_listener, (void *)ctx);
 
+#if WITH_LIBDECOR
+    // create libdecor context
+    // - for error event
+    libdecor_error_context = ctx;
+    ctx->wl.libdecor_context = libdecor_new(ctx->wl.display, &libdecor_listener);
+
+    // create libdecor frame
+    // - for configure event
+    // - for commit event
+    // - for close event
+    ctx->wl.libdecor_frame = libdecor_decorate(ctx->wl.libdecor_context, ctx->wl.surface, &libdecor_frame_listener, ctx);
+
+    // set libdecor app properties
+    libdecor_frame_set_app_id(ctx->wl.libdecor_frame, "at.yrlf.wl_mirror");
+    libdecor_frame_set_title(ctx->wl.libdecor_frame, "Wayland Output Mirror");
+
+    // map libdecor frame
+    libdecor_frame_map(ctx->wl.libdecor_frame);
+
+    // commit surface to trigger configure sequence
+    wl_surface_commit(ctx->wl.surface);
+
+    // wait for events
+    // - expecting libdecor frame configure event
+    wl_display_roundtrip(ctx->wl.display);
+#else
     // create xdg surface
     ctx->wl.xdg_surface = xdg_wm_base_get_xdg_surface(ctx->wl.wm_base, ctx->wl.surface);
     if (ctx->wl.xdg_surface == NULL) {
@@ -728,6 +867,7 @@ void init_wl(ctx_t * ctx) {
     // - expecting surface configure event
     // - expecting xdg toplevel configure event
     wl_display_roundtrip(ctx->wl.display);
+#endif
 
     // check if surface is configured
     // - expecting surface to be configured at this point
@@ -740,7 +880,11 @@ void init_wl(ctx_t * ctx) {
 // --- set_window_title ---
 
 void set_window_title(ctx_t * ctx, const char * title) {
+#ifdef WITH_LIBDECOR
+    libdecor_frame_set_title(ctx->wl.libdecor_frame, title);
+#else
     xdg_toplevel_set_title(ctx->wl.xdg_toplevel, title);
+#endif
 }
 
 // --- cleanup_wl ---
@@ -771,8 +915,13 @@ void cleanup_wl(ctx_t *ctx) {
     if (ctx->wl.dmabuf_manager != NULL) zwlr_export_dmabuf_manager_v1_destroy(ctx->wl.dmabuf_manager);
     if (ctx->wl.screencopy_manager != NULL) zwlr_screencopy_manager_v1_destroy(ctx->wl.screencopy_manager);
     if (ctx->wl.shm != NULL) wl_shm_destroy(ctx->wl.shm);
+#ifdef WITH_LIBDECOR
+    if (ctx->wl.libdecor_frame != NULL) libdecor_frame_unref(ctx->wl.libdecor_frame);
+    if (ctx->wl.libdecor_context != NULL) libdecor_unref(ctx->wl.libdecor_context);
+#else
     if (ctx->wl.xdg_toplevel != NULL) xdg_toplevel_destroy(ctx->wl.xdg_toplevel);
     if (ctx->wl.xdg_surface != NULL) xdg_surface_destroy(ctx->wl.xdg_surface);
+#endif
     if (ctx->wl.surface != NULL) wl_surface_destroy(ctx->wl.surface);
     if (ctx->wl.output_manager != NULL) zxdg_output_manager_v1_destroy(ctx->wl.output_manager);
     if (ctx->wl.wm_base != NULL) xdg_wm_base_destroy(ctx->wl.wm_base);

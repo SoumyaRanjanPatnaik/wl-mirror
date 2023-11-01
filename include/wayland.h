@@ -9,6 +9,10 @@
 #include "wlr-export-dmabuf-unstable-v1.h"
 #include "wlr-screencopy-unstable-v1.h"
 
+#ifdef WITH_LIBDECOR
+#include <libdecor.h>
+#endif
+
 struct ctx;
 
 typedef struct output_list_node {
@@ -56,8 +60,13 @@ typedef struct ctx_wl {
 
     // surface objects
     struct wl_surface * surface;
+#ifdef WITH_LIBDECOR
+    struct libdecor * libdecor_context;
+    struct libdecor_frame * libdecor_frame;
+#else
     struct xdg_surface * xdg_surface;
     struct xdg_toplevel * xdg_toplevel;
+#endif
 
     // buffer size
     output_list_node_t * current_output;
@@ -70,8 +79,10 @@ typedef struct ctx_wl {
 
     // state flags
     uint32_t last_surface_serial;
+#ifndef WITH_LIBDECOR
     bool xdg_surface_configured;
     bool xdg_toplevel_configured;
+#endif
     bool configured;
     bool closing;
     bool initialized;
